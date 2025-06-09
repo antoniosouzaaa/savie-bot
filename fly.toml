@@ -1,0 +1,19 @@
+# fly.toml app configuration file generated for savie-bot on 2025-06-09T10:19:20-03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'savie-bot'
+primary_region = 'gru'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[[mounts]]
+  source = 'savie_data'
+  destination = '/data'
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1

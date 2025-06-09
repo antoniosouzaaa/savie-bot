@@ -1,0 +1,13 @@
+# requirements.txt
+python-telegram-bot==21.0.1
+aiohttp
+httpx
+google-generativeai
+
+# Descomente as linhas abaixo apenas se você implementou
+# as funções de foto e áudio, pois elas podem precisar
+# de outras dependências no sistema.
+Pillow
+pytesseract
+SpeechRecognition
+pydub
