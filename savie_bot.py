@@ -1,5 +1,5 @@
 # Savie - Seu Assistente Financeiro Pessoal
-# Versão 12.4 - FINAL COMPLETO E FUNCIONAL
+# Versão 12.5 - FINAL COM CORREÇÃO DE PARCELAMENTO
 
 import logging, os, re, sqlite3, json, asyncio, locale, io, csv
 from datetime import datetime, date, timedelta
@@ -106,42 +106,6 @@ class SavieBot:
             self.conn.execute("UPDATE users SET full_name = ?, email = ? WHERE user_id = ?", (full_name, email, user_id))
             self.conn.commit()
 
-    def create_shared_bill(self, creator_user_id, creator_username, group_chat_id, description, total_amount):
-        with self.conn:
-            cursor = self.conn.cursor()
-            cursor.execute("INSERT INTO shared_bills (creator_user_id, creator_username, group_chat_id, description, total_amount) VALUES (?, ?, ?, ?, ?)", (creator_user_id, creator_username, group_chat_id, description, str(total_amount)))
-            self.conn.commit()
-            return cursor.lastrowid
-            
-    def add_bill_participant(self, bill_id, username, amount_due):
-        user = self.get_user_by_username(username)
-        user_id = user['user_id'] if user else None
-        with self.conn:
-            cursor = self.conn.cursor()
-            cursor.execute("INSERT INTO bill_participants (bill_id, participant_user_id, participant_username, amount_due) VALUES (?, ?, ?, ?)", (bill_id, user_id, username, str(amount_due)))
-            self.conn.commit()
-            return cursor.lastrowid
-
-    def update_bill_summary_message(self, bill_id, message_id):
-        with self.conn: self.conn.execute("UPDATE shared_bills SET summary_message_id = ? WHERE id = ?", (message_id, bill_id)); self.conn.commit()
-
-    def get_user_by_username(self, username):
-        cursor = self.conn.cursor(); cursor.execute("SELECT user_id FROM users WHERE username = ?", (username,)); return cursor.fetchone()
-
-    def mark_participant_as_paid(self, participant_id, payer_user_id):
-        with self.conn:
-            cursor = self.conn.cursor()
-            cursor.execute("UPDATE bill_participants SET status = 'paid' WHERE id = ? AND (participant_user_id = ? OR participant_user_id IS NULL)", (participant_id, payer_user_id))
-            cursor.execute("UPDATE bill_participants SET participant_user_id = ? WHERE id = ? AND participant_user_id IS NULL", (payer_user_id, participant_id))
-            self.conn.commit()
-            cursor.execute("SELECT bill_id FROM bill_participants WHERE id = ?", (participant_id,)); return cursor.fetchone()['bill_id']
-
-    def get_bill_status(self, bill_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM shared_bills WHERE id = ?", (bill_id,)); bill_info = cursor.fetchone()
-        cursor.execute("SELECT participant_username, status FROM bill_participants WHERE bill_id = ?", (bill_id,)); participants = cursor.fetchall()
-        return bill_info, participants
-    
     def parse_expense_text(self, text: str) -> dict | None:
         match = re.search(r'(\d[\d.,]*)', text);
         if not match: return None
@@ -347,16 +311,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_keyboard_buttons(update, context)
         return
 
-    installment_match = re.search(r'(\d+)\s*x', text, re.I) or re.search(r'parcelado em\s*(\d+)', text, re.I)
-    if installment_match:
-        await process_installment_text(update, context, installment_match)
-    else:
-        parsed_data = savie.parse_expense_text(text)
-        if parsed_data:
-            await process_single_expense_text(update, context)
-        else:
-            resposta_ia = await generate_natural_response(text, update.effective_user.first_name)
-            await update.message.reply_text(resposta_ia)
+    text_lower = text.lower()
+    installment_keywords = ['x', 'vezes', 'parcela']
+    
+    parsed_data = savie.parse_expense_text(text)
+
+    if not parsed_data:
+        resposta_ia = await generate_natural_response(text, update.effective_user.first_name)
+        await update.message.reply_text(resposta_ia)
+        return
+
+    is_installment_intent = any(keyword in text_lower for keyword in installment_keywords)
+
+    if is_installment_intent:
+        match = re.search(r'(\d+)\s*(x|vezes|parcela)', text_lower)
+        if match and int(match.group(1)) > 1:
+            installments_count = int(match.group(1))
+            await process_installment_text(update, context, parsed_data, installments_count)
+            return
+
+    await process_single_expense_text(update, context, parsed_data)
 
 async def check_for_anomalies_and_patterns(user_id: int, expense: dict, context: ContextTypes.DEFAULT_TYPE):
     if savie.check_challenge_violation(user_id, expense['category']):
@@ -382,22 +356,32 @@ async def daily_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=challenge['user_id'], text=f"🏆 Parabéns! Você completou com sucesso o desafio de não gastar em *{challenge['target_category']}*! Continue assim!", parse_mode='Markdown')
     except Exception as e: logger.error(f"Scheduler: Erro ao executar tarefas diárias: {e}")
 
-async def process_single_expense_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed_data = savie.parse_expense_text(update.message.text)
-    if not parsed_data or parsed_data['amount'] <= 0: await update.message.reply_text("😕 Desculpe, não consegui entender o valor. Tente algo como: `Lanche 25,50`"); return
-    amount, desc = parsed_data['amount'], parsed_data['description']; category = savie.categorize_expense(desc)
+async def process_single_expense_text(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed_data: dict):
+    if not parsed_data or parsed_data['amount'] <= 0:
+        await update.message.reply_text("😕 Desculpe, não consegui entender o valor. Tente algo como: `Lanche 25,50`")
+        return
+    
+    amount, desc = parsed_data['amount'], parsed_data['description']
+    category = savie.categorize_expense(desc)
     context.user_data['pending_expense'] = {'amount': amount, 'desc': desc, 'category': category}
-    preview_text = f"✅ *Gasto reconhecido!*\n\n💵 *Valor:* R$ {amount:.2f}\n📝 *Descrição:* {desc}\n🏷️ *Categoria:* {category}\n\nPosso confirmar?"; keyboard = [[InlineKeyboardButton("👍 Confirmar", callback_data=CALLBACK_CONFIRM_EXPENSE), InlineKeyboardButton("❌ Cancelar", callback_data=CALLBACK_CANCEL)]]
+    preview_text = f"✅ *Gasto reconhecido!*\n\n💵 *Valor:* R$ {amount:.2f}\n📝 *Descrição:* {desc}\n🏷️ *Categoria:* {category}\n\nPosso confirmar?"
+    keyboard = [[InlineKeyboardButton("👍 Confirmar", callback_data=CALLBACK_CONFIRM_EXPENSE), InlineKeyboardButton("❌ Cancelar", callback_data=CALLBACK_CANCEL)]]
     await update.message.reply_text(preview_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def process_installment_text(update: Update, context: ContextTypes.DEFAULT_TYPE, match: re.Match):
-    parsed_data = savie.parse_expense_text(update.message.text)
-    if not parsed_data or parsed_data['amount'] <= 0: await update.message.reply_text("😕 Não entendi os detalhes. Tente: `Notebook 3000 em 10x`"); return
-    total_amount, desc = parsed_data['amount'], parsed_data['description']; installments_count = int(match.group(1))
-    if installments_count <= 1: return await process_single_expense_text(update, context)
-    installment_value = total_amount / Decimal(installments_count); category = savie.categorize_expense(desc)
+async def process_installment_text(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed_data: dict, installments_count: int):
+    if not parsed_data or parsed_data['amount'] <= 0:
+        await update.message.reply_text("😕 Não entendi os detalhes do parcelamento. Tente: `Notebook 3000 em 10x`")
+        return
+
+    total_amount, desc = parsed_data['amount'], parsed_data['description']
+    installment_value = total_amount / Decimal(installments_count)
+    category = savie.categorize_expense(desc)
     context.user_data['pending_installment'] = {'total_amount': total_amount, 'desc': desc, 'category': category, 'count': installments_count}
-    preview_text = (f"💳 *Parcelamento reconhecido!*\n\n🛍️ *Descrição:* {desc}\n💰 *Valor Total:* R$ {total_amount:.2f}\n📅 *Parcelas:* {installments_count}x de R$ {installment_value:.2f}\n🏷️ *Categoria:* {category}\n\nConfirma o registro?")
+    preview_text = (f"💳 *Parcelamento reconhecido!*\n\n"
+                    f"🛍️ *Descrição:* {desc}\n"
+                    f"💰 *Valor Total:* R$ {total_amount:.2f}\n"
+                    f"📅 *Parcelas:* {installments_count}x de R$ {installment_value:.2f}\n"
+                    f"🏷️ *Categoria:* {category}\n\nConfirma o registro?")
     keyboard = [[InlineKeyboardButton("👍 Confirmar", callback_data=CALLBACK_CONFIRM_INSTALLMENT), InlineKeyboardButton("❌ Cancelar", callback_data=CALLBACK_CANCEL)]]
     await update.message.reply_text(preview_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
