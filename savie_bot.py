@@ -1,5 +1,5 @@
 # Savie - Seu Assistente Financeiro Pessoal
-# Versão 12.0 - FINAL E CONSOLIDADA
+# Versão 12.0 - FINAL E CONSOLIDADA (Com Cadastro Obrigatório)
 
 import logging, os, re, sqlite3, json, asyncio, locale
 from datetime import datetime, date, timedelta
@@ -17,21 +17,28 @@ logger = logging.getLogger(__name__)
 try:
     locale.setlocale(locale.LC_ALL, 'pt_BR.UTF-8')
 except locale.Error:
-    try: locale.setlocale(locale.LC_ALL, 'Portuguese_Brazil.1252')
-    except locale.Error: logger.warning("Locale 'pt_BR' não encontrado. Nomes de meses podem aparecer em inglês.")
+    try:
+        locale.setlocale(locale.LC_ALL, 'Portuguese_Brazil.1252')
+    except locale.Error:
+        logger.warning("Locale 'pt_BR' não encontrado. Nomes de meses podem aparecer em inglês.")
 
 # --- Constantes e Chaves de API ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = os.getenv("DB_PATH", "savie_bot.db")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-if GOOGLE_API_KEY: genai.configure(api_key=GOOGLE_API_KEY)
-else: logger.warning("Chave de API do Google não encontrada. A IA está desativada.")
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+else:
+    logger.warning("Chave de API do Google não encontrada. A IA está desativada.")
 
-# --- Constantes de Callback ---
+# --- Constantes de Callback e Estado ---
 CALLBACK_CONFIRM_EXPENSE = "confirm_exp"; CALLBACK_CONFIRM_INSTALLMENT = "confirm_inst"; CALLBACK_CANCEL = "cancel_op"
 CALLBACK_DELETE_MENU_LAST = "del_menu_last"; CALLBACK_DELETE_MENU_ALL = "del_menu_all"; CALLBACK_DELETE_CONFIRM_LAST = "del_conf_last"; CALLBACK_DELETE_CONFIRM_ALL = "del_conf_all"
 CALLBACK_ADD_RECURRING = "add_recur"; CALLBACK_CHALLENGE_ACCEPT = "chall_accept"; CALLBACK_PAY_BILL = "pay_bill"
+# Constantes de estado para o fluxo de cadastro obrigatório
+STATE_ASKING_NAME = "state_ask_name"
+STATE_ASKING_EMAIL = "state_ask_email"
 
 def add_months(source_date: date, months: int) -> date:
     month = source_date.month - 1 + months; year = source_date.year + month // 12; month = month % 12 + 1
@@ -46,7 +53,17 @@ class SavieBot:
     def setup_database(self):
         with self.conn:
             cursor = self.conn.cursor()
-            cursor.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)')
+            # Adicionadas colunas full_name e email para o cadastro
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    full_name TEXT,
+                    email TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
             cursor.execute('CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount DECIMAL(10,2) NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL, date DATE NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, is_installment BOOLEAN DEFAULT FALSE, installment_id INTEGER, FOREIGN KEY (user_id) REFERENCES users (user_id))')
             cursor.execute('CREATE TABLE IF NOT EXISTS installments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, total_amount DECIMAL(10,2) NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL, total_installments INTEGER NOT NULL, start_date DATE NOT NULL, FOREIGN KEY (user_id) REFERENCES users (user_id))')
             cursor.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, keywords TEXT NOT NULL, emoji TEXT NOT NULL)')
@@ -70,13 +87,27 @@ class SavieBot:
             self.conn.execute('UPDATE users SET username = ?, first_name = ? WHERE user_id = ?', (username, first_name, user_id))
         self.conn.commit()
 
+    def get_user_profile(self, user_id: int):
+        """Verifica se o usuário já tem nome completo e email cadastrados."""
+        with self.conn:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT full_name, email FROM users WHERE user_id = ?", (user_id,))
+            return cursor.fetchone()
+
+    def update_user_profile(self, user_id: int, full_name: str, email: str):
+        """Atualiza o nome completo e o email do usuário."""
+        with self.conn:
+            self.conn.execute("UPDATE users SET full_name = ?, email = ? WHERE user_id = ?", (full_name, email, user_id))
+            self.conn.commit()
+
+    # --- O restante dos seus métodos da classe SavieBot continua aqui, sem alterações ---
+    # ... (create_shared_bill, add_bill_participant, etc.) ...
     def create_shared_bill(self, creator_user_id, creator_username, group_chat_id, description, total_amount):
         with self.conn:
             cursor = self.conn.cursor()
             cursor.execute("INSERT INTO shared_bills (creator_user_id, creator_username, group_chat_id, description, total_amount) VALUES (?, ?, ?, ?, ?)", (creator_user_id, creator_username, group_chat_id, description, str(total_amount)))
             self.conn.commit()
             return cursor.lastrowid
-
     def add_bill_participant(self, bill_id, username, amount_due):
         user = self.get_user_by_username(username)
         user_id = user['user_id'] if user else None
@@ -85,13 +116,10 @@ class SavieBot:
             cursor.execute("INSERT INTO bill_participants (bill_id, participant_user_id, participant_username, amount_due) VALUES (?, ?, ?, ?)", (bill_id, user_id, username, str(amount_due)))
             self.conn.commit()
             return cursor.lastrowid
-
     def update_bill_summary_message(self, bill_id, message_id):
         with self.conn: self.conn.execute("UPDATE shared_bills SET summary_message_id = ? WHERE id = ?", (message_id, bill_id)); self.conn.commit()
-
     def get_user_by_username(self, username):
         cursor = self.conn.cursor(); cursor.execute("SELECT user_id FROM users WHERE username = ?", (username,)); return cursor.fetchone()
-
     def mark_participant_as_paid(self, participant_id, payer_user_id):
         with self.conn:
             cursor = self.conn.cursor()
@@ -99,14 +127,11 @@ class SavieBot:
             cursor.execute("UPDATE bill_participants SET participant_user_id = ? WHERE id = ? AND participant_user_id IS NULL", (payer_user_id, participant_id))
             self.conn.commit()
             cursor.execute("SELECT bill_id FROM bill_participants WHERE id = ?", (participant_id,)); return cursor.fetchone()['bill_id']
-
     def get_bill_status(self, bill_id):
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM shared_bills WHERE id = ?", (bill_id,)); bill_info = cursor.fetchone()
         cursor.execute("SELECT participant_username, status FROM bill_participants WHERE bill_id = ?", (bill_id,)); participants = cursor.fetchall()
         return bill_info, participants
-    
-    # ... (Restante dos métodos da classe, todos já corretos)
     def parse_expense_text(self, text: str) -> dict | None:
         match = re.search(r'(\d[\d.,]*)', text);
         if not match: return None
@@ -185,13 +210,106 @@ class SavieBot:
             completed_ids = [c['id'] for c in completed];
             with self.conn: self.conn.execute(f"UPDATE challenges SET status = 'completed' WHERE id IN ({','.join('?' for _ in completed_ids)})", completed_ids); self.conn.commit()
         return completed
+    def get_active_installments(self, user_id: int) -> list:
+        # Este método estava faltando no código original, adicionado para /parcelas funcionar
+        cursor = self.conn.cursor()
+        query = """
+            SELECT i.description, i.total_amount, i.total_installments,
+                   (SELECT COUNT(*) FROM expenses WHERE installment_id = i.id) as paid_count
+            FROM installments i
+            WHERE i.user_id = ? AND
+                  (SELECT COUNT(*) FROM expenses WHERE installment_id = i.id) < i.total_installments
+            ORDER BY i.start_date DESC
+        """
+        cursor.execute(query, (user_id,))
+        return cursor.fetchall()
 
 
 # Instância do Bot
 savie = SavieBot(db_path=DB_PATH)
 
-# Funções de Lógica do Bot
+# --- Handlers (Funções que respondem ao usuário) ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    savie.register_user(user.id, user.username, user.first_name)
+    
+    # Verifica se o usuário já está cadastrado
+    profile = savie.get_user_profile(user.id)
+    if profile and profile['full_name'] and profile['email']:
+        welcome_text = (f"👋 *Olá de novo, {profile['full_name'].split()[0]}!* Que bom te ver.\n\n"
+                        "Use os botões abaixo ou me envie um gasto para começar.")
+        keyboard = [[KeyboardButton("📊 Gastos do Mês"), KeyboardButton("📈 Por Categoria")], [KeyboardButton("💳 Ver Parcelas"), KeyboardButton("❓ Ajuda")], [KeyboardButton("🎯 Desafios"), KeyboardButton("🗑️ Excluir Dados")]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=reply_markup)
+    else:
+        # Se não está cadastrado, inicia o fluxo
+        await update.message.reply_text(
+            f"👋 *Olá, {user.first_name}! Eu sou o Savie, seu assistente financeiro.*\n\n"
+            "Para começar, preciso que complete seu cadastro. Por favor, digite seu *nome completo*.",
+            parse_mode='Markdown'
+        )
+        context.user_data['state'] = STATE_ASKING_NAME
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    state = context.user_data.get('state')
+
+    # --- INÍCIO DO FLUXO DE CADASTRO DE PERFIL (OBRIGATÓRIO) ---
+    if state == STATE_ASKING_NAME:
+        full_name = text.strip()
+        if len(full_name.split()) < 2: # Validação simples de nome completo
+             await update.message.reply_text("Por favor, digite seu nome e sobrenome.")
+             return
+        context.user_data['full_name'] = full_name
+        await update.message.reply_text(
+            f"Obrigado, {full_name.split()[0]}! Agora, por favor, digite seu *melhor e-mail*.",
+            parse_mode='Markdown'
+        )
+        context.user_data['state'] = STATE_ASKING_EMAIL
+        return
+
+    if state == STATE_ASKING_EMAIL:
+        email = text.lower().strip()
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+            await update.message.reply_text("🤔 Hmm, este e-mail não parece válido. Por favor, tente novamente.")
+            return
+
+        full_name = context.user_data.get('full_name')
+        savie.update_user_profile(user_id, full_name, email)
+
+        context.user_data.clear()
+        keyboard = [[KeyboardButton("📊 Gastos do Mês"), KeyboardButton("📈 Por Categoria")], [KeyboardButton("💳 Ver Parcelas"), KeyboardButton("❓ Ajuda")], [KeyboardButton("🎯 Desafios"), KeyboardButton("🗑️ Excluir Dados")]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(
+            "✅ *Cadastro concluído com sucesso!*\n\n"
+            "Agora sim! Você já pode usar todas as minhas funcionalidades. Tente me enviar um gasto, como `Café 10,50`.",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+        return
+    # --- FIM DO FLUXO DE CADASTRO ---
+
+    # "Portão" para todas as outras mensagens e comandos implícitos (botões)
+    profile = savie.get_user_profile(user_id)
+    if not (profile and profile['full_name'] and profile['email']):
+         await start(update, context) # Re-chama o start se o usuário não estiver cadastrado
+         return
+
+    # O resto da sua função handle_message original continua aqui...
+    if text in ["📊 Gastos do Mês", "📈 Por Categoria", "💳 Ver Parcelas", "❓ Ajuda", "🎯 Desafios", "🗑️ Excluir Dados"]:
+        return await handle_keyboard_buttons(update, context)
+
+    installment_match = re.search(r'(\d+)\s*x', text, re.I) or re.search(r'parcelado em\s*(\d+)', text, re.I)
+    if installment_match:
+        await process_installment_text(update, context, installment_match)
+    else:
+        await process_single_expense_text(update, context)
+
 async def check_for_anomalies_and_patterns(user_id: int, expense: dict, context: ContextTypes.DEFAULT_TYPE):
+    # Esta função não precisa do gatekeeper porque só é chamada após um gasto ser confirmado.
+    # ... (código original da função)
     if savie.check_challenge_violation(user_id, expense['category']):
         await context.bot.send_message(chat_id=user_id, text=f"Ah, não! 😟\nVocê registrou um gasto na categoria *{expense['category']}* e quebrou seu desafio atual. Mas não desanime, você pode começar um novo com o comando /desafio!", parse_mode='Markdown'); return
     analytics = savie.get_spending_analytics(user_id, expense['category'])
@@ -215,24 +333,9 @@ async def daily_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=challenge['user_id'], text=f"🏆 Parabéns! Você completou com sucesso o desafio de não gastar em *{challenge['target_category']}*! Continue assim!", parse_mode='Markdown')
     except Exception as e: logger.error(f"Scheduler: Erro ao executar tarefas diárias: {e}")
 
-# Handlers (Funções que respondem ao usuário)
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user; savie.register_user(user.id, user.username, user.first_name)
-    welcome_text = (f"👋 *Olá, {user.first_name}! Eu sou o Savie, seu assistente financeiro pessoal.*\n\n"
-                    "Comigo, você pode organizar suas finanças de forma simples. Apenas me envie seus gastos!\n\n"
-                    "Use os botões abaixo ou digite um comando para começar.")
-    keyboard = [[KeyboardButton("📊 Gastos do Mês"), KeyboardButton("📈 Por Categoria")], [KeyboardButton("💳 Ver Parcelas"), KeyboardButton("❓ Ajuda")], [KeyboardButton("🎯 Desafios"), KeyboardButton("🗑️ Excluir Dados")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(welcome_text, parse_mode='Markdown', reply_markup=reply_markup)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text in ["📊 Gastos do Mês", "📈 Por Categoria", "💳 Ver Parcelas", "❓ Ajuda", "🎯 Desafios", "🗑️ Excluir Dados"]: return await handle_keyboard_buttons(update, context)
-    installment_match = re.search(r'(\d+)\s*x', text, re.I) or re.search(r'parcelado em\s*(\d+)', text, re.I)
-    if installment_match: await process_installment_text(update, context, installment_match)
-    else: await process_single_expense_text(update, context)
-
 async def process_single_expense_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Esta função não precisa do gatekeeper, pois é chamada por handle_message que já tem.
+    # ... (código original da função)
     parsed_data = savie.parse_expense_text(update.message.text)
     if not parsed_data or parsed_data['amount'] <= 0: await update.message.reply_text("😕 Desculpe, não consegui entender o valor. Tente algo como: `Lanche 25,50`"); return
     amount, desc = parsed_data['amount'], parsed_data['description']; category = savie.categorize_expense(desc)
@@ -241,6 +344,8 @@ async def process_single_expense_text(update: Update, context: ContextTypes.DEFA
     await update.message.reply_text(preview_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def process_installment_text(update: Update, context: ContextTypes.DEFAULT_TYPE, match: re.Match):
+    # Esta função não precisa do gatekeeper, pois é chamada por handle_message que já tem.
+    # ... (código original da função)
     parsed_data = savie.parse_expense_text(update.message.text)
     if not parsed_data or parsed_data['amount'] <= 0: await update.message.reply_text("😕 Não entendi os detalhes. Tente: `Notebook 3000 em 10x`"); return
     total_amount, desc = parsed_data['amount'], parsed_data['description']; installments_count = int(match.group(1))
@@ -251,21 +356,14 @@ async def process_installment_text(update: Update, context: ContextTypes.DEFAULT
     keyboard = [[InlineKeyboardButton("👍 Confirmar", callback_data=CALLBACK_CONFIRM_INSTALLMENT), InlineKeyboardButton("❌ Cancelar", callback_data=CALLBACK_CANCEL)]]
     await update.message.reply_text(preview_text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def excluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "Selecione o que você deseja excluir:"; keyboard = [[InlineKeyboardButton("🗑️ Excluir Último Gasto", callback_data=CALLBACK_DELETE_MENU_LAST)], [InlineKeyboardButton("🔥 APAGAR TUDO", callback_data=CALLBACK_DELETE_MENU_ALL)], [InlineKeyboardButton("❌ Cancelar", callback_data=CALLBACK_CANCEL)]]
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def desafio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    challenge_category = "🍽️ Alimentação"; challenge_days = 7
-    text = (f"Olá! Que tal um desafio para apimentar sua jornada financeira?\n\n"
-            f"🎯 *O Desafio:* Ficar **{challenge_days} dias** sem registrar nenhum gasto na categoria *{challenge_category}* (restaurantes, iFood, etc.).\n\n"
-            "Isso te ajudará a economizar e ter mais consciência dos seus gastos. Aceita?")
-    payload = f"{challenge_category}|{challenge_days}"
-    keyboard = [[InlineKeyboardButton("✅ Sim, aceito o desafio!", callback_data=f"{CALLBACK_CHALLENGE_ACCEPT}|{payload}"), InlineKeyboardButton("❌ Talvez depois", callback_data=CALLBACK_CANCEL)]]
-    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
-
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Callbacks também devem ser protegidos se o usuário não estiver registrado
     query = update.callback_query; await query.answer(); user_id = query.from_user.id
+    profile = savie.get_user_profile(user_id)
+    if not (profile and profile['full_name'] and profile['email']):
+        await query.edit_message_text("Por favor, complete seu cadastro primeiro. Envie /start.")
+        return
+    # ... (resto do código da função handle_callback)
     parts = query.data.split('|', 1); action = parts[0]; payload = parts[1] if len(parts) > 1 else None
     try:
         if action == CALLBACK_CONFIRM_EXPENSE:
@@ -309,20 +407,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Erro no callback '{query.data}': {e}"); await query.edit_message_text("😕 Ocorreu um erro. Tente novamente.")
 
+# --- Gatekeeper para comandos diretos ---
+async def gatekeeper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Função de verificação para comandos. Retorna True se o usuário pode prosseguir."""
+    user_id = update.effective_user.id
+    profile = savie.get_user_profile(user_id)
+    if profile and profile['full_name'] and profile['email']:
+        return True
+    # Se não estiver cadastrado, chama o /start para iniciar o fluxo
+    await start(update, context)
+    return False
+
 async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context): return
     help_text = ("*🤖 Central de Ajuda do Savie*\n\n*Como Registrar Gastos*\n• *Texto:* Envie `Cinema 50 reais`.\n• *Parcelas:* Envie `TV 2500 em 10x`.\n\n*Comandos*\n`/start` - Reinicia o bot.\n`/gastos` - Resumo do mês.\n`/categorias` - Gastos por categoria.\n`/parcelas` - Compras parceladas ativas.\n`/desafio` - Comece um desafio para economizar.\n`/excluir` - Apagar registros.\n`/rachar` - (Em grupos) Dividir uma conta.\n`/ajuda` - Exibe esta mensagem.")
     await update.message.reply_text(help_text, parse_mode='Markdown')
 
-async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "📊 Gastos do Mês": await gastos_mes(update, context)
-    elif text == "📈 Por Categoria": await gastos_por_categoria(update, context)
-    elif text == "💳 Ver Parcelas": await compras_parceladas(update, context)
-    elif text == "🎯 Desafios": await desafio(update, context)
-    elif text == "🗑️ Excluir Dados": await excluir(update, context)
-    elif text == "❓ Ajuda": await ajuda(update, context)
-
 async def gastos_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context): return
     user_id = update.effective_user.id; summary = savie.get_monthly_summary(user_id)
     if not summary: await update.message.reply_text("Você ainda não registrou nenhum gasto este mês. Comece agora!"); return
     month_name = datetime.now().strftime('%B de %Y').capitalize()
@@ -330,6 +432,7 @@ async def gastos_mes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(report, parse_mode='Markdown')
 
 async def gastos_por_categoria(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context): return
     user_id = update.effective_user.id; summary = savie.get_monthly_summary(user_id)
     if not summary: await update.message.reply_text("Você ainda não registrou nenhum gasto este mês."); return
     month_name = datetime.now().strftime('%B de %Y').capitalize()
@@ -340,6 +443,7 @@ async def gastos_por_categoria(update: Update, context: ContextTypes.DEFAULT_TYP
     report += f"\n💰 *Total Geral:* R$ {total_geral:.2f}"; await update.message.reply_text(report, parse_mode='Markdown')
 
 async def compras_parceladas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context): return
     user_id = update.effective_user.id; installments = savie.get_active_installments(user_id)
     if not installments: await update.message.reply_text("Você não possui nenhuma compra parcelada ativa no momento. ✅"); return
     report = "💳 *Suas Compras Parceladas Ativas*\n\n"; total_pending = Decimal(0)
@@ -350,38 +454,47 @@ async def compras_parceladas(update: Update, context: ContextTypes.DEFAULT_TYPE)
         report += f" ({item['paid_count']}/{item['total_installments']}) *R$ {installment_amount:.2f}* por mês\n"
         report += f"💸 Restam *R$ {remaining_amount:.2f}*\n\n"
     report += f"💰 *Total pendente de todas as parcelas: R$ {total_pending:.2f}*"; await update.message.reply_text(report, parse_mode='Markdown')
-    
+
+async def excluir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context): return
+    text = "Selecione o que você deseja excluir:"; keyboard = [[InlineKeyboardButton("🗑️ Excluir Último Gasto", callback_data=CALLBACK_DELETE_MENU_LAST)], [InlineKeyboardButton("🔥 APAGAR TUDO", callback_data=CALLBACK_DELETE_MENU_ALL)], [InlineKeyboardButton("❌ Cancelar", callback_data=CALLBACK_CANCEL)]]
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def desafio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context): return
+    challenge_category = "🍽️ Alimentação"; challenge_days = 7
+    text = (f"Olá! Que tal um desafio para apimentar sua jornada financeira?\n\n"
+            f"🎯 *O Desafio:* Ficar **{challenge_days} dias** sem registrar nenhum gasto na categoria *{challenge_category}* (restaurantes, iFood, etc.).\n\n"
+            "Isso te ajudará a economizar e ter mais consciência dos seus gastos. Aceita?")
+    payload = f"{challenge_category}|{challenge_days}"
+    keyboard = [[InlineKeyboardButton("✅ Sim, aceito o desafio!", callback_data=f"{CALLBACK_CHALLENGE_ACCEPT}|{payload}"), InlineKeyboardButton("❌ Talvez depois", callback_data=CALLBACK_CANCEL)]]
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
+
 async def rachar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await gatekeeper(update, context): return
     if update.message.chat.type == 'private':
         await update.message.reply_text("Este comando só funciona em grupos!"); return
+    # ... (resto do código da função rachar)
     try:
         args = context.args
-        if len(args) < 2 or not args[0].isnumeric() or not any(a.startswith('@') for a in args):
+        if len(args) < 2 or not args[0].replace('.','',1).replace(',','',1).isdigit() or not any(a.startswith('@') for a in args):
             await update.message.reply_text("Uso: /rachar <valor> @amigo1 @amigo2... <descrição>"); return
-
-        total_amount = Decimal(args[0])
+        total_amount = Decimal(args[0].replace(',', '.'))
         mentions = [arg.replace('@', '') for arg in args if arg.startswith('@')]
         creator_username = update.message.from_user.username
         if creator_username and creator_username not in mentions:
             mentions.append(creator_username)
-        
         description_parts = [arg for arg in args[1:] if not arg.startswith('@')]
         description = ' '.join(description_parts) or "Conta compartilhada"
-        
         num_participants = len(mentions)
         amount_per_person = total_amount / num_participants
-
         bill_id = savie.create_shared_bill(update.message.from_user.id, creator_username, update.message.chat_id, description, total_amount)
         participant_ids = {username: savie.add_bill_participant(bill_id, username, amount_per_person) for username in mentions}
-
-        # Constrói e envia a mensagem de resumo
         bill_info, participants = savie.get_bill_status(bill_id)
         summary_text = f"**Conta Rachada por @{creator_username}**\n\n📝 *Descrição:* {description}\n💰 *Total:* R$ {total_amount:.2f} (R$ {amount_per_person:.2f} por pessoa)\n\n*Participantes:*\n"
         for p in participants: summary_text += f"⏳ @{p['participant_username']}\n"
-        
         summary_message = await update.message.reply_text(summary_text, parse_mode=ParseMode.MARKDOWN)
         savie.update_bill_summary_message(bill_id, summary_message.message_id)
-
         for username, participant_id in participant_ids.items():
             if username == creator_username: continue
             user = savie.get_user_by_username(username)
@@ -393,6 +506,16 @@ async def rachar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Erro no comando /rachar: {e}"); await update.message.reply_text("Ocorreu um erro ao processar o racha da conta.")
 
+
+async def handle_keyboard_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Esta função não precisa do gatekeeper, pois é chamada por handle_message que já tem.
+    text = update.message.text
+    if text == "📊 Gastos do Mês": await gastos_mes(update, context)
+    elif text == "📈 Por Categoria": await gastos_por_categoria(update, context)
+    elif text == "💳 Ver Parcelas": await compras_parceladas(update, context)
+    elif text == "🎯 Desafios": await desafio(update, context)
+    elif text == "🗑️ Excluir Dados": await excluir(update, context)
+    elif text == "❓ Ajuda": await ajuda(update, context)
 
 def main() -> None:
     if not BOT_TOKEN:
