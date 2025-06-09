@@ -1,5 +1,5 @@
 # requirements.txt
-python-telegram-bot==21.0.1
+python-telegram-bot[job-queue]
 aiohttp
 httpx
 google-generativeai

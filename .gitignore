@@ -1,0 +1,12 @@
+# Ignorar arquivos temporários do Python
+__pycache__/
+*.pyc
+
+# Ignorar o banco de dados local
+savie_bot.db
+
+# Ignorar arquivos de ambiente que podem conter segredos
+.env
+
+# Ignorar arquivos de configuração de editores
+.vscode/
